@@ -6,17 +6,15 @@ database, keyed by person + date, so you can pull weekly or cumulative
 attendance reports straight in the chat.
 
 Commands (use inside the group):
-    /attendance             - Post a plain Yes/No attendance poll (today's date)
-    /attendance <date>      - Post a poll for a specific date/label
-    /attendance <hours>     - Post a poll where each "Yes" auto-logs that many hours
-    /attendance <hours> <date>  - Both of the above combined
-    /report       - Show results for the most recent attendance poll
+    /attendance                       - Post a plain Yes/No attendance poll (today's date)
+    /attendance <date>                - Post a poll for a specific date/label
+    /attendance <date>,<hours>        - Each "Yes" auto-logs that many hours for the person
+    /attendance <date>,<hours>,<deadline>  - Also auto-closes the poll after a duration (e.g. 2h, 1d)
+    /stoppoll     - Manually close the most recent poll (attendance or bus) early
     /summary      - Show each person's overall attendance % (all-time)
     /export       - Send a CSV file with all raw attendance + hours data
     /bus <date>   - Post a transport poll (4 options: two-way / one-way from / one-way to / none)
     /busreport    - Show results for the most recent bus poll
-    /loghours     - Manually log volunteering hours (personal record)
-    /myhours      - View your own logged hours (not shared with the group)
 
 Setup:
     1. pip install -r requirements.txt
@@ -33,9 +31,10 @@ import io
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update, InputFile
@@ -76,7 +75,10 @@ def init_db():
             question           TEXT NOT NULL,
             hours_per_session  REAL,
             poll_type          TEXT DEFAULT 'attendance',   -- 'attendance' or 'bus'
-            options_json       TEXT                          -- JSON list of this poll's option texts
+            options_json       TEXT,                         -- JSON list of this poll's option texts
+            message_id         INTEGER,                      -- needed to close/stop the poll later
+            deadline           TEXT,                          -- ISO datetime; poll auto-closes after this
+            closed             INTEGER DEFAULT 0             -- 1 once auto-closed by the deadline checker
         );
 
         CREATE TABLE IF NOT EXISTS responses (
@@ -108,6 +110,9 @@ def init_db():
     for stmt in (
         "ALTER TABLE polls ADD COLUMN poll_type TEXT DEFAULT 'attendance'",
         "ALTER TABLE polls ADD COLUMN options_json TEXT",
+        "ALTER TABLE polls ADD COLUMN message_id INTEGER",
+        "ALTER TABLE polls ADD COLUMN deadline TEXT",
+        "ALTER TABLE polls ADD COLUMN closed INTEGER DEFAULT 0",
         "ALTER TABLE volunteer_hours ADD COLUMN poll_id TEXT",
     ):
         try:
@@ -128,32 +133,65 @@ def init_db():
 # ---------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------
+_DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$", re.IGNORECASE)
+
+
+def parse_duration(text: str):
+    """Parse a short duration like '2h', '90m', '1.5d' into a timedelta, or None if invalid."""
+    match = _DURATION_RE.match(text.strip())
+    if not match:
+        return None
+    value = float(match.group(1))
+    unit = match.group(2).lower()
+    if unit.startswith("m"):
+        return timedelta(minutes=value)
+    if unit.startswith("h"):
+        return timedelta(hours=value)
+    if unit.startswith("d"):
+        return timedelta(days=value)
+    return None
+
+
 async def attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Post a new non-anonymous Yes/No attendance poll.
 
-    Usage:
-        /attendance                    -> plain poll, uses today's date, no hour tracking
-        /attendance Sat 23 Aug         -> plain poll, custom date label, no hour tracking
-        /attendance 3.5                -> today's date, and every "Yes" auto-logs 3.5 hours
-        /attendance 3.5 Sat 23 Aug     -> custom date label + 3.5 hours per "Yes"
+    Usage (comma-separated — leave a field blank to skip it):
+        /attendance                          -> today's date, no hours, no deadline
+        /attendance Sat 23 Aug                -> just a custom date label
+        /attendance ,3.5                      -> today's date, each "Yes" auto-logs 3.5 hours
+        /attendance Sat 23 Aug,3.5             -> custom date + hours
+        /attendance Sat 23 Aug,3.5,2h          -> date + hours + auto-closes in 2 hours
+        /attendance ,,1d                       -> today's date, no hours, auto-closes in 1 day
+        (deadline understands m/h/d, e.g. "30m", "2h", "1d")
     """
     chat_id = update.effective_chat.id
 
-    args = list(context.args)
+    raw_text = " ".join(context.args) if context.args else ""
+    parts = [p.strip() for p in raw_text.split(",")] if raw_text else []
+    while len(parts) < 3:
+        parts.append("")
+    date_part, hours_part, deadline_part = parts[0], parts[1], parts[2]
+
+    date_label = date_part if date_part else datetime.now().strftime("%d %b %Y")
+
     hours_per_session = None
-
-    # If the first word is a number, treat it as the hours for this session
-    if args:
+    if hours_part:
         try:
-            hours_per_session = float(args[0])
-            args = args[1:]  # remaining words are the date label
+            hours_per_session = float(hours_part)
         except ValueError:
-            pass  # first word isn't a number, so no hour tracking for this poll
+            await update.message.reply_text(
+                f"Couldn't read \"{hours_part}\" as hours — skipping hour tracking for this poll."
+            )
 
-    if args:
-        date_label = " ".join(args)
-    else:
-        date_label = datetime.now().strftime("%d %b %Y")
+    deadline_at = None
+    if deadline_part:
+        duration = parse_duration(deadline_part)
+        if duration is None:
+            await update.message.reply_text(
+                f"Couldn't read \"{deadline_part}\" as a deadline (use e.g. 30m, 2h, 1d) — skipping auto-close."
+            )
+        else:
+            deadline_at = datetime.now() + duration
 
     question = f"Attendance – {date_label}"
     if hours_per_session is not None:
@@ -170,15 +208,85 @@ async def attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_conn()
     conn.execute(
         """
-        INSERT INTO polls (poll_id, chat_id, created_at, question, hours_per_session, poll_type, options_json)
-        VALUES (?, ?, ?, ?, ?, 'attendance', ?)
+        INSERT INTO polls (poll_id, chat_id, created_at, question, hours_per_session, poll_type, options_json, message_id, deadline)
+        VALUES (?, ?, ?, ?, ?, 'attendance', ?, ?, ?)
         """,
-        (message.poll.id, chat_id, datetime.now().isoformat(), question, hours_per_session, json.dumps(["Yes", "No"])),
+        (
+            message.poll.id, chat_id, datetime.now().isoformat(), question, hours_per_session,
+            json.dumps(["Yes", "No"]), message.message_id,
+            deadline_at.isoformat() if deadline_at else None,
+        ),
     )
     conn.commit()
     conn.close()
 
-    logger.info(f"Posted attendance poll {message.poll.id} in chat {chat_id} (hours_per_session={hours_per_session})")
+    if deadline_at:
+        if context.job_queue is not None:
+            context.job_queue.run_once(
+                _auto_close_poll,
+                when=deadline_at,
+                data={"chat_id": chat_id, "message_id": message.message_id, "poll_id": message.poll.id},
+                name=f"autoclose_{message.poll.id}",
+            )
+            await update.message.reply_text(
+                f"This poll will auto-close on {deadline_at.strftime('%d %b, %I:%M%p')}."
+            )
+        else:
+            await update.message.reply_text(
+                "Poll posted, but I couldn't schedule the auto-close — the job scheduler isn't "
+                "available (check that requirements.txt includes the job-queue extra)."
+            )
+
+    logger.info(f"Posted attendance poll {message.poll.id} in chat {chat_id} (hours_per_session={hours_per_session}, deadline={deadline_at})")
+
+
+async def _auto_close_poll(context: ContextTypes.DEFAULT_TYPE):
+    """Job callback: stops a poll once its deadline has passed."""
+    data = context.job.data
+    chat_id, message_id, poll_id = data["chat_id"], data["message_id"], data["poll_id"]
+
+    conn = get_conn()
+    already_closed = conn.execute(
+        "SELECT closed FROM polls WHERE poll_id = ?", (poll_id,)
+    ).fetchone()
+    if already_closed and already_closed[0]:
+        conn.close()
+        return  # someone already stopped it manually — nothing to do
+
+    try:
+        await context.bot.stop_poll(chat_id=chat_id, message_id=message_id)
+        conn.execute("UPDATE polls SET closed = 1 WHERE poll_id = ?", (poll_id,))
+        conn.commit()
+        await context.bot.send_message(chat_id=chat_id, text="⏰ Poll auto-closed — its deadline was reached.")
+    except Exception as e:
+        logger.warning(f"Failed to auto-close poll {poll_id}: {e}")
+    finally:
+        conn.close()
+
+
+def _reschedule_pending_deadlines(app):
+    """Re-arms auto-close jobs for polls with a future deadline that haven't fired yet.
+    Needed because scheduled jobs are only kept in memory and are lost on a restart/redeploy."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT poll_id, chat_id, message_id, deadline FROM polls "
+        "WHERE deadline IS NOT NULL AND closed = 0 AND message_id IS NOT NULL"
+    ).fetchall()
+    conn.close()
+
+    now = datetime.now()
+    for poll_id, chat_id, message_id, deadline_str in rows:
+        deadline_at = datetime.fromisoformat(deadline_str)
+        # If the deadline already passed while the bot was offline, close it almost immediately;
+        # otherwise schedule it for the remaining time.
+        when = deadline_at if deadline_at > now else (now + timedelta(seconds=5))
+        app.job_queue.run_once(
+            _auto_close_poll,
+            when=when,
+            data={"chat_id": chat_id, "message_id": message_id, "poll_id": poll_id},
+            name=f"autoclose_{poll_id}",
+        )
+        logger.info(f"Re-armed auto-close for poll {poll_id} at {when}")
 
 
 async def bus(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -211,15 +319,59 @@ async def bus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_conn()
     conn.execute(
         """
-        INSERT INTO polls (poll_id, chat_id, created_at, question, hours_per_session, poll_type, options_json)
-        VALUES (?, ?, ?, ?, NULL, 'bus', ?)
+        INSERT INTO polls (poll_id, chat_id, created_at, question, hours_per_session, poll_type, options_json, message_id)
+        VALUES (?, ?, ?, ?, NULL, 'bus', ?, ?)
         """,
-        (message.poll.id, chat_id, datetime.now().isoformat(), question, json.dumps(options)),
+        (message.poll.id, chat_id, datetime.now().isoformat(), question, json.dumps(options), message.message_id),
     )
     conn.commit()
     conn.close()
 
     logger.info(f"Posted bus poll {message.poll.id} in chat {chat_id}")
+
+
+async def stoppoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Close (stop) the most recent poll so no more votes can be cast.
+
+    Usage:
+        /stoppoll             -> closes whichever poll (attendance or bus) was posted most recently
+        /stoppoll attendance  -> closes the most recent attendance poll specifically
+        /stoppoll bus         -> closes the most recent bus poll specifically
+    """
+    chat_id = update.effective_chat.id
+    poll_type_filter = context.args[0].lower() if context.args else None
+
+    conn = get_conn()
+    if poll_type_filter in ("attendance", "bus"):
+        poll = conn.execute(
+            "SELECT poll_id, message_id, question FROM polls WHERE chat_id = ? AND poll_type = ? ORDER BY created_at DESC LIMIT 1",
+            (chat_id, poll_type_filter),
+        ).fetchone()
+    else:
+        poll = conn.execute(
+            "SELECT poll_id, message_id, question FROM polls WHERE chat_id = ? ORDER BY created_at DESC LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+    conn.close()
+
+    if poll is None:
+        await update.message.reply_text("No poll found to stop.")
+        return
+
+    poll_id, message_id, question = poll
+
+    if message_id is None:
+        await update.message.reply_text(
+            f"Can't stop \"{question}\" — it was created before this feature was added, "
+            "so I don't have its message ID. New polls from now on can be stopped."
+        )
+        return
+
+    try:
+        await context.bot.stop_poll(chat_id=chat_id, message_id=message_id)
+        await update.message.reply_text(f"Stopped: \"{question}\" — no more votes can be cast on it. ✅")
+    except Exception as e:
+        await update.message.reply_text(f"Couldn't stop that poll (it may already be closed). Details: {e}")
 
 
 async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -551,16 +703,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Attendance bot ready.\n\n"
         "/attendance – plain Yes/No poll (today's date)\n"
         "/attendance <date> – custom date label, e.g. /attendance Sat 23 Aug\n"
-        "/attendance <hours> – each \"Yes\" auto-logs that many hours, e.g. /attendance 3.5\n"
-        "/attendance <hours> <date> – both combined, e.g. /attendance 3.5 Sat 23 Aug\n"
-        "/report – results of the latest attendance poll\n"
+        "/attendance <date>,<hours> – each \"Yes\" auto-logs hours, e.g. /attendance Sat 23 Aug,3.5\n"
+        "/attendance <date>,<hours>,<deadline> – also auto-closes the poll, e.g. /attendance Sat 23 Aug,3.5,2h\n"
+        "  (leave a field blank to skip it, e.g. /attendance ,3.5 for hours only; deadline uses m/h/d)\n"
+        "/stoppoll – manually close the most recent poll early\n"
         "/summary – all-time attendance % per person\n"
         "/export – download all data as CSV\n\n"
         "/bus <date> – post a transport poll, e.g. /bus 22 Aug\n"
-        "/busreport – results of the latest bus poll\n\n"
-        "/loghours <hours> [note] – manually log volunteering hours\n"
-        "  (reply to someone's message with this to log it for them instead)\n"
-        "/myhours – see your own personal hours record (not shared with the group)"
+        "/busreport – results of the latest bus poll"
     )
 
 
@@ -608,13 +758,16 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("attendance", attendance))
     app.add_handler(CommandHandler("bus", bus))
-    app.add_handler(CommandHandler("report", report))
+    app.add_handler(CommandHandler("stoppoll", stoppoll))
     app.add_handler(CommandHandler("busreport", busreport))
     app.add_handler(CommandHandler("summary", summary))
     app.add_handler(CommandHandler("export", export))
-    app.add_handler(CommandHandler("loghours", loghours))
-    app.add_handler(CommandHandler("myhours", myhours))
     app.add_handler(PollAnswerHandler(poll_answer))
+
+    if app.job_queue is not None:
+        _reschedule_pending_deadlines(app)
+    else:
+        logger.warning("job_queue not available — deadlines won't auto-close. Check requirements.txt has the job-queue extra.")
 
     logger.info("Bot starting...")
     app.run_polling()
