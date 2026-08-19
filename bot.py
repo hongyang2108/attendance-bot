@@ -26,7 +26,9 @@ import io
 import logging
 import os
 import sqlite3
+import threading
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update, InputFile
 from telegram.constants import ParseMode
@@ -86,10 +88,21 @@ def init_db():
 # Commands
 # ---------------------------------------------------------------------
 async def attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Post a new non-anonymous Yes/No attendance poll."""
+    """Post a new non-anonymous Yes/No attendance poll.
+
+    Usage:
+        /attendance                -> uses today's date
+        /attendance Sat 23 Aug     -> uses whatever text you type instead
+    """
     chat_id = update.effective_chat.id
-    today_str = datetime.now().strftime("%d %b %Y")
-    question = f"Attendance – {today_str}"
+
+    if context.args:
+        # User supplied a custom date/label, e.g. "/attendance Sat 23 Aug"
+        date_label = " ".join(context.args)
+    else:
+        date_label = datetime.now().strftime("%d %b %Y")
+
+    question = f"Attendance – {date_label}"
 
     message = await context.bot.send_poll(
         chat_id=chat_id,
@@ -253,11 +266,35 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Attendance bot ready.\n\n"
-        "/attendance – post this week's Yes/No poll\n"
+        "/attendance – post this week's Yes/No poll (uses today's date)\n"
+        "/attendance <date> – post a poll for a specific date, e.g. /attendance Sat 23 Aug\n"
         "/report – results of the latest poll\n"
         "/summary – all-time attendance % per person\n"
         "/export – download all data as CSV"
     )
+
+
+# ---------------------------------------------------------------------
+# Tiny web server (required by Render's free "web service" tier, which
+# expects something listening on a port and responding to HTTP requests
+# to know the app is alive; ping it periodically with a free uptime
+# monitor like UptimeRobot to keep it from sleeping)
+# ---------------------------------------------------------------------
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Attendance bot is running.")
+
+    def log_message(self, format, *args):
+        pass  # silence default access logging
+
+
+def _start_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    server.serve_forever()
 
 
 # ---------------------------------------------------------------------
@@ -272,6 +309,10 @@ def main():
         )
 
     init_db()
+
+    # Start the tiny web server in the background so Render sees the
+    # app as "live" (this thread does nothing but answer health checks)
+    threading.Thread(target=_start_health_server, daemon=True).start()
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
